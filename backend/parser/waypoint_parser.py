@@ -7,7 +7,7 @@ Columns are tab-separated (falls back to whitespace).
 """
 import math
 from pathlib import Path
-from models.mission import WaypointItem, MissionInfo
+from models.mission import Mission, WaypointItem
 
 # MAVLink command IDs relevant to path planning
 _CMD_NAV_WAYPOINT = 16
@@ -16,25 +16,18 @@ _CMD_NAV_LAND = 21
 _CMD_NAV_TAKEOFF = 22
 _CMD_DO_CHANGE_SPEED = 178
 
-_GPS_FIX_NAMES: dict[int, str] = {
-    0: "No GPS",
-    1: "No Fix",
-    2: "2D Fix",
-    3: "3D Fix",
-    4: "DGPS",
-    5: "RTK Float",
-    6: "RTK Fixed",
-}
-
 _EXPECTED_COLUMNS = 12
 _SUPPORTED_VERSION = 110
 
 
 class WaypointParseError(ValueError):
-    """Raised when a .waypoints file fails parsing or validation."""
+    """Raised when a mission file fails parsing or validation.
+
+    Re-used by plan_parser and loader — kept here as the canonical definition.
+    """
 
 
-def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Return great-circle distance in metres between two WGS-84 points."""
     R = 6_371_000.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
@@ -47,15 +40,15 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 class QGCWaypointParser:
     """Stateless parser for QGC WPL 110 mission files."""
 
-    def parse_bytes(self, data: bytes, filename: str = "mission.waypoints") -> MissionInfo:
-        """Parse raw file bytes and return a validated MissionInfo."""
+    def parse_bytes(self, data: bytes, filename: str = "mission.waypoints") -> Mission:
+        """Parse raw file bytes and return a validated Mission."""
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise WaypointParseError("File is not valid UTF-8 text.") from exc
         return self._parse(text, filename)
 
-    def _parse(self, text: str, filename: str) -> MissionInfo:
+    def _parse(self, text: str, filename: str) -> Mission:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if not lines:
             raise WaypointParseError("File is empty.")
@@ -73,7 +66,7 @@ class QGCWaypointParser:
                 f"Mission has {len(waypoints)} waypoints; limit is 1000."
             )
 
-        return self._build_info(waypoints, filename)
+        return self._build_mission(waypoints, filename)
 
     # ── Header ─────────────────────────────────────────────────────────────────
 
@@ -120,18 +113,16 @@ class QGCWaypointParser:
         except (ValueError, IndexError) as exc:
             raise WaypointParseError(f"Line {line_num}: cannot parse values — {exc}.") from exc
 
-    # ── Mission info builder ───────────────────────────────────────────────────
+    # ── Mission builder ────────────────────────────────────────────────────────
 
-    def _build_info(self, waypoints: list[WaypointItem], filename: str) -> MissionInfo:
-        # Navigation waypoints (exclude home at index 0 and commands without position)
+    def _build_mission(self, waypoints: list[WaypointItem], filename: str) -> Mission:
         nav_points = [
             w for w in waypoints
             if w.command == _CMD_NAV_WAYPOINT and (w.latitude != 0 or w.longitude != 0)
         ]
 
-        total_m = self._total_path_distance(nav_points)
+        total_m = _path_distance_m(nav_points)
 
-        # Honour the first DO_CHANGE_SPEED param2 as cruise speed
         cruise_speed = 5.0
         for w in waypoints:
             if w.command == _CMD_DO_CHANGE_SPEED and w.param2 > 0:
@@ -139,16 +130,15 @@ class QGCWaypointParser:
                 break
 
         duration_s = total_m / max(cruise_speed, 0.1)
-
-        # Rough battery draw: 20 A cruise at a nominal pack capacity
         pack_mah = 16_000.0
         consumed_mah = (duration_s / 3600.0) * 20.0 * 1000.0
         battery_pct = min((consumed_mah / pack_mah) * 100.0, 100.0)
 
         altitudes = [w.altitude for w in waypoints if w.altitude > 0]
 
-        return MissionInfo(
+        return Mission(
             filename=Path(filename).name,
+            source_format="waypoints",
             waypoint_count=len(waypoints),
             nav_waypoints=len(nav_points),
             total_distance_m=round(total_m, 1),
@@ -160,12 +150,13 @@ class QGCWaypointParser:
             waypoints=waypoints,
         )
 
-    @staticmethod
-    def _total_path_distance(nav: list[WaypointItem]) -> float:
-        total = 0.0
-        for i in range(1, len(nav)):
-            total += _haversine_m(
-                nav[i - 1].latitude, nav[i - 1].longitude,
-                nav[i].latitude,     nav[i].longitude,
-            )
-        return total
+
+def _path_distance_m(nav: list[WaypointItem]) -> float:
+    """Sum of haversine distances along a sequence of nav waypoints."""
+    total = 0.0
+    for i in range(1, len(nav)):
+        total += haversine_m(
+            nav[i - 1].latitude, nav[i - 1].longitude,
+            nav[i].latitude,     nav[i].longitude,
+        )
+    return total

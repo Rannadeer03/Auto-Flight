@@ -254,10 +254,10 @@
                   d="M12 16.5V9.75m0 0 3 3m-3-3-3 3M6.75 19.5a4.5 4.5 0 0 1-1.41-8.775 5.25 5.25 0 0 1 10.338-2.32 5.75 5.75 0 0 1 1.04 11.095"/>
           </svg>
           <div>
-            <p class="text-sm text-slate-300 font-medium">Drop .waypoints file here</p>
+            <p class="text-sm text-slate-300 font-medium">Drop .waypoints or .plan file here</p>
             <p class="text-xs text-slate-500 mt-0.5">or click to browse</p>
           </div>
-          <input id="file-input" type="file" accept=".waypoints" class="hidden" />
+          <input id="file-input" type="file" accept=".waypoints,.plan" class="hidden" />
         </div>
 
         <!-- Selected file info -->
@@ -297,6 +297,8 @@
         <!-- Mission info panel -->
         <div id="mission-info-panel" class="hidden bg-slate-900/60 rounded-lg p-3 border border-slate-700 space-y-1">
           <p class="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">Mission Details</p>
+          <div class="tele-row"><span class="tele-label">Format</span>
+            <span id="mi-fmt" class="tele-value text-sky-300"></span></div>
           <div class="tele-row"><span class="tele-label">Total Waypoints</span>
             <span id="mi-wpts" class="tele-value"></span></div>
           <div class="tele-row"><span class="tele-label">Nav Waypoints</span>

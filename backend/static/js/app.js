@@ -86,8 +86,9 @@ class MissionPlanner {
   // ══════════════════════════════════════════════════════════════════════════
 
   _handleFileSelect(file) {
-    if (!file.name.toLowerCase().endsWith('.waypoints')) {
-      this.showToast('Only .waypoints files are accepted.', 'error');
+    const name = file.name.toLowerCase();
+    if (!name.endsWith('.waypoints') && !name.endsWith('.plan')) {
+      this.showToast('Only .waypoints and .plan files are accepted.', 'error');
       return;
     }
     this.selectedFile = file;
@@ -505,6 +506,7 @@ class MissionPlanner {
   _showMissionInfo(info) {
     if (!info) return;
     this._show('mission-info-panel');
+    this._setText('mi-fmt',    info.source_format === 'plan' ? 'QGC .plan (JSON)' : 'QGC .waypoints');
     this._setText('mi-wpts',   String(info.waypoint_count));
     this._setText('mi-nav',    String(info.nav_waypoints));
     this._setText('mi-dist',   `${info.total_distance_km.toFixed(3)} km (${info.total_distance_m.toFixed(0)} m)`);

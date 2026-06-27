@@ -6,12 +6,15 @@ Implements the full GCS→Vehicle handshake:
   Vehicle sends MISSION_REQUEST_INT (or MISSION_REQUEST) per item
   GCS sends MISSION_ITEM_INT for each requested index
   Vehicle sends MISSION_ACK
+
+The uploader operates exclusively on Mission objects and has no knowledge
+of file formats.  Format parsing is the parser layer's responsibility.
 """
 import logging
 import time
 from pymavlink import mavutil
 from mavlink.connection import MAVLinkConnection
-from models.mission import WaypointItem
+from models.mission import Mission, WaypointItem
 
 logger = logging.getLogger(__name__)
 
@@ -45,17 +48,25 @@ class MissionUploader:
         logger.warning("Mission clear timed out or not accepted (ack=%s).", ack)
         return False
 
-    def upload_waypoints(self, waypoints: list[WaypointItem]) -> bool:
-        """Upload a waypoint list to the vehicle using the MAVLink handshake.
+    def upload_mission(self, mission: Mission) -> bool:
+        """Upload a Mission to the vehicle using the MAVLink handshake protocol.
+
+        The Mission object is format-agnostic; this method only cares about the
+        list of WaypointItems it contains.
 
         Returns True on success, raises MissionUploadError on protocol failure.
         """
         m = self._require_master()
+        waypoints = mission.waypoints
         count = len(waypoints)
+
         if count == 0:
             raise MissionUploadError("Cannot upload an empty mission.")
 
-        logger.info("Uploading %d mission items.", count)
+        logger.info(
+            "Uploading %d mission items from '%s' (format=%s).",
+            count, mission.filename, mission.source_format,
+        )
 
         m.mav.mission_count_send(
             m.target_system,

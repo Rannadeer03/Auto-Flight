@@ -1,10 +1,10 @@
 """Pydantic models for mission data."""
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 
 class WaypointItem(BaseModel):
-    """A single item from a QGC .waypoints mission file."""
+    """A single MAVLink mission item, format-agnostic."""
 
     index: int
     current: bool
@@ -20,10 +20,15 @@ class WaypointItem(BaseModel):
     autocontinue: bool
 
 
-class MissionInfo(BaseModel):
-    """Parsed mission summary, computed after loading a .waypoints file."""
+class Mission(BaseModel):
+    """Canonical mission object returned by all parsers.
+
+    Both QGC .waypoints and .plan files are normalised into this model
+    before anything else in the system sees them.
+    """
 
     filename: str
+    source_format: str          # "waypoints" | "plan"
     waypoint_count: int
     nav_waypoints: int
     total_distance_m: float
@@ -35,6 +40,10 @@ class MissionInfo(BaseModel):
     waypoints: list[WaypointItem]
 
 
+# Backward-compatibility alias — existing code that references MissionInfo continues to work.
+MissionInfo = Mission
+
+
 class MissionStatus(BaseModel):
     """Real-time mission execution status."""
 
@@ -43,7 +52,7 @@ class MissionStatus(BaseModel):
     current_waypoint: int = 0
     total_waypoints: int = 0
     progress_percent: float = 0.0
-    mission_info: Optional[MissionInfo] = None
+    mission_info: Optional[Mission] = None
 
 
 class ApiResponse(BaseModel):
@@ -59,5 +68,5 @@ class UploadResponse(BaseModel):
 
     success: bool
     message: str
-    mission_info: Optional[MissionInfo] = None
+    mission_info: Optional[Mission] = None
     uploaded_to_drone: bool = False

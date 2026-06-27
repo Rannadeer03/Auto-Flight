@@ -21,7 +21,7 @@ class Settings:
     # ── File upload ────────────────────────────────────────────────────────────
     MAX_UPLOAD_BYTES: int = int(os.environ.get("MAX_UPLOAD_SIZE_MB", "10")) * 1024 * 1024
     UPLOAD_DIR: Path = BASE_DIR / "uploads" / "missions"
-    ALLOWED_EXTENSIONS: frozenset = frozenset({".waypoints"})
+    ALLOWED_EXTENSIONS: frozenset = frozenset({".waypoints", ".plan"})
 
     # ── Logging ────────────────────────────────────────────────────────────────
     LOG_DIR: Path = BASE_DIR / "logs"
