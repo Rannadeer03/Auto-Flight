@@ -171,7 +171,9 @@ class QGCPlanParser:
     ) -> Mission:
         nav_points = [
             w for w in waypoints
-            if w.command == _CMD_NAV_WAYPOINT and (w.latitude != 0 or w.longitude != 0)
+            if w.command == _CMD_NAV_WAYPOINT
+            and not w.current                        # exclude home position (index 0)
+            and (w.latitude != 0 or w.longitude != 0)
         ]
 
         total_m = _path_distance_m(nav_points)
