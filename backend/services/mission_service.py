@@ -61,6 +61,9 @@ class MissionService:
         self._current_mission = mission
         uploaded = False
 
+        verified = False
+        verification_message = ""
+
         if drone_state.connected:
             logger.info("Uploading mission to Pixhawk.")
             self._uploader.clear_mission()
@@ -77,6 +80,13 @@ class MissionService:
                 mission.total_distance_km,
                 mission.estimated_duration_minutes,
             )
+
+            # Read the mission back from the vehicle and verify every item
+            verified, verification_message = self._uploader.verify_mission(mission)
+            if not verified:
+                logger.error("Mission verification failed: %s", verification_message)
+            else:
+                logger.info("Mission verification passed.")
         else:
             logger.info(
                 "Drone not connected — mission parsed (%s) but not sent to vehicle.",
@@ -87,10 +97,15 @@ class MissionService:
             "mission_info": mission,
             "uploaded_to_drone": uploaded,
             "saved_path": str(save_path),
+            "verified": verified,
+            "verification_message": verification_message,
         }
 
-    def upload_current_to_drone(self) -> None:
-        """Push the already-parsed mission to the Pixhawk (used after late connect)."""
+    def upload_current_to_drone(self) -> tuple[bool, str]:
+        """Push the already-parsed mission to the Pixhawk (used after late connect).
+
+        Returns (verified, verification_message).
+        """
         if not self._current_mission:
             raise RuntimeError("No mission loaded. Upload a .waypoints or .plan file first.")
         if not drone_state.connected:
@@ -107,6 +122,10 @@ class MissionService:
             self._current_mission.waypoint_count,
             self._current_mission.source_format,
         )
+        verified, verification_message = self._uploader.verify_mission(self._current_mission)
+        if not verified:
+            logger.error("Mission verification failed: %s", verification_message)
+        return verified, verification_message
 
     def clear_mission(self) -> None:
         """Clear mission from vehicle and reset local state."""

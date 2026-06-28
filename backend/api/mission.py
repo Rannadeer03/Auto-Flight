@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from models.mission import ApiResponse, MissionStatus, UploadResponse
 from mavlink.connection import drone_state
+from mavlink.mission_upload import MissionUploadError
 from parser.waypoint_parser import WaypointParseError
 from services.mission_service import mission_service
 
@@ -12,7 +13,7 @@ router = APIRouter(tags=["mission"])
 
 @router.post("/upload", response_model=UploadResponse)
 async def upload_mission(file: UploadFile = File(...)) -> UploadResponse:
-    """Accept a .waypoints file, parse it, and upload it to the Pixhawk if connected."""
+    """Accept a .waypoints or .plan file, parse it, and upload it to the Pixhawk if connected."""
     if file.filename is None or file.filename == "":
         raise HTTPException(status_code=400, detail="No filename provided.")
 
@@ -23,6 +24,10 @@ async def upload_mission(file: UploadFile = File(...)) -> UploadResponse:
     except WaypointParseError as exc:
         logger.warning("Mission parse error: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc))
+    except MissionUploadError as exc:
+        # Protocol-level failure communicating with the Pixhawk
+        logger.error("MAVLink upload error: %s", exc)
+        raise HTTPException(status_code=502, detail=f"MAVLink upload error: {exc}")
     except RuntimeError as exc:
         logger.error("Mission upload error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -30,14 +35,24 @@ async def upload_mission(file: UploadFile = File(...)) -> UploadResponse:
         logger.exception("Unexpected error during mission upload.")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
 
-    msg = "Mission parsed and uploaded to vehicle." if result["uploaded_to_drone"] else \
-          "Mission parsed and saved. Connect to drone to upload to vehicle."
+    uploaded = result["uploaded_to_drone"]
+    verified = result.get("verified", False)
+    verify_msg = result.get("verification_message", "")
+
+    if uploaded and verified:
+        msg = "Mission uploaded and verified on vehicle."
+    elif uploaded and not verified:
+        msg = f"Mission uploaded but verification failed: {verify_msg}"
+    else:
+        msg = "Mission parsed and saved. Connect to drone to upload."
 
     return UploadResponse(
         success=True,
         message=msg,
         mission_info=result["mission_info"],
-        uploaded_to_drone=result["uploaded_to_drone"],
+        uploaded_to_drone=uploaded,
+        verified=verified,
+        verification_message=verify_msg,
     )
 
 

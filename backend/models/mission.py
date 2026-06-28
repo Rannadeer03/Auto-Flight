@@ -70,3 +70,5 @@ class UploadResponse(BaseModel):
     message: str
     mission_info: Optional[Mission] = None
     uploaded_to_drone: bool = False
+    verified: bool = False
+    verification_message: str = ""

@@ -3,16 +3,33 @@ MAVLink connection manager.
 
 Owns the serial connection to the Pixhawk and maintains a background receiver
 thread that continuously reads MAVLink messages and updates the shared DroneState.
-All other modules interact with the Pixhawk exclusively through this module.
+
+KEY DESIGN — waiter queues
+==========================
+Protocol-level exchanges (mission upload, command acks, mission verification)
+require exclusive access to specific incoming message types.  The background
+receiver thread now routes any message type that has an active waiter into that
+waiter's queue instead of the normal telemetry dispatch.  Protocol handlers call
+register_waiter() BEFORE sending their request, then read from the returned queue,
+then call unregister_waiter() when done.
+
+This eliminates the race condition where the receiver thread consumed
+MISSION_REQUEST_INT / COMMAND_ACK messages before the protocol handler could
+read them, causing silent upload and command failures.
 """
+import glob
 import logging
 import math
+import platform
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from pymavlink import mavutil
+
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +83,42 @@ GPS_FIX_NAMES: dict[int, str] = {
     5: "RTK Float",
     6: "RTK Fixed",
 }
+
+
+# ── Port detection ─────────────────────────────────────────────────────────────
+
+def detect_pixhawk_port() -> Optional[str]:
+    """
+    Scan for the first connected Pixhawk / flight-controller serial port.
+
+    macOS:  /dev/cu.usbmodem*  (cu.* preferred — avoids tty.* locking issues)
+    Linux:  /dev/ttyACM*  then  /dev/ttyUSB*
+    """
+    system = platform.system()
+    if system == "Darwin":
+        patterns = ["/dev/cu.usbmodem*", "/dev/tty.usbmodem*"]
+    else:
+        patterns = ["/dev/ttyACM*", "/dev/ttyUSB*"]
+
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            return matches[0]
+    return None
+
+
+def list_available_ports() -> list[str]:
+    """Return all candidate Pixhawk serial ports found on this system."""
+    system = platform.system()
+    if system == "Darwin":
+        patterns = ["/dev/cu.usbmodem*", "/dev/tty.usbmodem*"]
+    else:
+        patterns = ["/dev/ttyACM*", "/dev/ttyUSB*"]
+
+    ports: list[str] = []
+    for pattern in patterns:
+        ports.extend(sorted(glob.glob(pattern)))
+    return ports
 
 
 # ── Shared drone state ─────────────────────────────────────────────────────────
@@ -130,7 +183,7 @@ class DroneState:
     current_waypoint: int = 0
     distance_to_waypoint: float = 0.0
 
-    # Health flags (populated from SYS_STATUS sensors bitmask)
+    # Health flags (from SYS_STATUS sensors bitmask)
     ekf_ok: bool = False
     gyro_ok: bool = False
     accel_ok: bool = False
@@ -185,14 +238,79 @@ drone_state = DroneState()
 # ── Connection class ───────────────────────────────────────────────────────────
 
 class MAVLinkConnection:
-    """Manages the physical MAVLink connection and the message receiver thread."""
+    """
+    Manages the physical MAVLink connection and the message receiver thread.
+
+    Protocol message routing
+    ------------------------
+    The background receiver thread reads ALL incoming bytes.  For telemetry
+    messages (GPS, ATTITUDE, …) it calls the appropriate telemetry handler.
+    For protocol messages that an active operation is waiting for (MISSION_REQUEST_INT,
+    COMMAND_ACK, …) it puts the message in the caller's queue via the waiter system.
+
+    Callers MUST register_waiter() BEFORE sending the MAVLink request and
+    MUST call unregister_waiter() in a finally block after they are done.
+    """
 
     def __init__(self) -> None:
         self._master: Optional[mavutil.mavfile] = None
+        self._port: Optional[str] = None
         self._receiver: Optional[threading.Thread] = None
         self._running: bool = False
         self._lock = threading.Lock()
         self.state = drone_state
+
+        # Waiter queues — keyed by MAVLink message type string.
+        # When a message type appears here, the receiver routes it to the queue
+        # instead of the telemetry handlers.
+        self._waiters: dict[str, queue.Queue] = {}
+        self._waiters_lock = threading.Lock()
+
+        # Build handler table once — not on every dispatched message.
+        self._handlers: dict[str, any] = {
+            "HEARTBEAT":             self._on_heartbeat,
+            "GPS_RAW_INT":           self._on_gps_raw,
+            "GLOBAL_POSITION_INT":   self._on_global_position,
+            "VFR_HUD":               self._on_vfr_hud,
+            "ATTITUDE":              self._on_attitude,
+            "BATTERY_STATUS":        self._on_battery_status,
+            "SYS_STATUS":            self._on_sys_status,
+            "MISSION_CURRENT":       self._on_mission_current,
+            "NAV_CONTROLLER_OUTPUT": self._on_nav_controller,
+            "EKF_STATUS_REPORT":     self._on_ekf_status,
+        }
+
+    # ── Waiter API ─────────────────────────────────────────────────────────────
+
+    def register_waiter(self, *msg_types: str) -> "queue.Queue":
+        """
+        Register interest in one or more MAVLink message types.
+
+        Returns a Queue.  All listed message types will be routed to this queue
+        by the receiver thread instead of the telemetry dispatch, until
+        unregister_waiter() is called.
+
+        Usage pattern (always use try/finally):
+            q = connection.register_waiter("MISSION_REQUEST_INT", "MISSION_ACK")
+            try:
+                master.mav.mission_count_send(...)
+                msg = q.get(timeout=5.0)
+            finally:
+                connection.unregister_waiter("MISSION_REQUEST_INT", "MISSION_ACK")
+        """
+        q: queue.Queue = queue.Queue()
+        with self._waiters_lock:
+            for t in msg_types:
+                self._waiters[t] = q
+        logger.debug("Waiter registered for: %s", list(msg_types))
+        return q
+
+    def unregister_waiter(self, *msg_types: str) -> None:
+        """Remove waiter registrations and restore normal telemetry dispatch."""
+        with self._waiters_lock:
+            for t in msg_types:
+                self._waiters.pop(t, None)
+        logger.debug("Waiter unregistered for: %s", list(msg_types))
 
     # ── Public interface ───────────────────────────────────────────────────────
 
@@ -204,30 +322,57 @@ class MAVLinkConnection:
     def is_connected(self) -> bool:
         return self._master is not None and self._running
 
-    def connect(self, port: str, baud: int, timeout: float = 10.0) -> None:
-        """Open the serial port, wait for heartbeat, then start the receiver thread.
+    def connect(self, port: str, baud: int, timeout: float = 15.0) -> None:
+        """
+        Open the serial port, wait for heartbeat, then start the receiver thread.
 
-        Raises ConnectionError on port failure and TimeoutError if no heartbeat arrives.
+        If port == "auto", scans for the Pixhawk automatically.
+
+        Raises:
+            ConnectionError  — serial port could not be opened, or no port found.
+            TimeoutError     — no heartbeat arrived within the timeout.
+            RuntimeError     — already connected.
         """
         with self._lock:
             if self._master is not None:
                 raise RuntimeError("Already connected. Call disconnect() first.")
 
+            if port == "auto":
+                detected = detect_pixhawk_port()
+                if detected is None:
+                    available = list_available_ports()
+                    if available:
+                        raise ConnectionError(
+                            f"No Pixhawk auto-detected on {available}. "
+                            "Specify MAVLINK_PORT explicitly or check USB connection."
+                        )
+                    raise ConnectionError(
+                        "No Pixhawk detected. Check USB cable and Pixhawk power. "
+                        "On macOS the port appears as /dev/cu.usbmodem*."
+                    )
+                logger.info("Auto-detected Pixhawk port: %s", detected)
+                port = detected
+
             logger.info("Opening MAVLink connection on %s @ %d baud.", port, baud)
             try:
                 master = mavutil.mavlink_connection(port, baud=baud, autoreconnect=False)
             except Exception as exc:
-                raise ConnectionError(f"Failed to open {port}: {exc}") from exc
+                raise ConnectionError(
+                    f"Failed to open serial port {port}: {exc}. "
+                    "Check the cable, permissions (/dev/ access), and baud rate."
+                ) from exc
 
-            logger.info("Waiting for heartbeat (timeout=%.1fs)…", timeout)
+            logger.info("Waiting for HEARTBEAT on %s (timeout=%.1fs)…", port, timeout)
             hb = master.wait_heartbeat(timeout=timeout)
             if hb is None:
                 master.close()
                 raise TimeoutError(
-                    f"No heartbeat from Pixhawk within {timeout}s. "
-                    "Check USB cable and Pixhawk power."
+                    f"No HEARTBEAT from Pixhawk within {timeout}s on {port}. "
+                    "Ensure Pixhawk is powered, firmware is running, and baud "
+                    f"rate {baud} matches the Pixhawk MAVLink port setting."
                 )
 
+            self._port = port
             self._master = master
             self._running = True
 
@@ -249,8 +394,9 @@ class MAVLinkConnection:
             self._receiver.start()
 
             logger.info(
-                "Connected — system_id=%d mode=%s armed=%s",
-                master.target_system, self.state.flight_mode, self.state.armed,
+                "Connected to Pixhawk on %s — system_id=%d  mode=%s  armed=%s",
+                port, master.target_system,
+                self.state.flight_mode, self.state.armed,
             )
 
     def disconnect(self) -> None:
@@ -268,6 +414,7 @@ class MAVLinkConnection:
                 except Exception:
                     pass
                 self._master = None
+            self._port = None
 
         self.state.update(connected=False)
         self.state.reset_flight_data()
@@ -290,29 +437,35 @@ class MAVLinkConnection:
         logger.debug("MAVLink receiver thread stopped.")
 
     def _dispatch(self, msg) -> None:
-        handlers = {
-            "HEARTBEAT":            self._on_heartbeat,
-            "GPS_RAW_INT":          self._on_gps_raw,
-            "GLOBAL_POSITION_INT":  self._on_global_position,
-            "VFR_HUD":              self._on_vfr_hud,
-            "ATTITUDE":             self._on_attitude,
-            "BATTERY_STATUS":       self._on_battery_status,
-            "SYS_STATUS":           self._on_sys_status,
-            "MISSION_CURRENT":      self._on_mission_current,
-            "NAV_CONTROLLER_OUTPUT": self._on_nav_controller,
-            "EKF_STATUS_REPORT":    self._on_ekf_status,
-        }
-        handler = handlers.get(msg.get_type())
+        msg_type = msg.get_type()
+
+        if settings.DEBUG_MAVLINK:
+            logger.info("[MAVLink RX] %s %s", msg_type, msg)
+
+        # ── Route to waiter FIRST ──────────────────────────────────────────────
+        # Protocol handlers (upload, command acks) register waiters before
+        # sending a request.  If a waiter is registered for this type, put
+        # the message in its queue and skip the telemetry dispatch entirely.
+        with self._waiters_lock:
+            waiter = self._waiters.get(msg_type)
+        if waiter is not None:
+            try:
+                waiter.put_nowait(msg)
+            except queue.Full:
+                logger.warning("Waiter queue full for %s — message dropped.", msg_type)
+            return
+
+        # ── Normal telemetry dispatch ──────────────────────────────────────────
+        handler = self._handlers.get(msg_type)
         if handler:
             try:
                 handler(msg)
             except Exception as exc:
-                logger.debug("Handler error [%s]: %s", msg.get_type(), exc)
+                logger.debug("Handler error [%s]: %s", msg_type, exc)
 
     # ── Message handlers ───────────────────────────────────────────────────────
 
     def _on_heartbeat(self, msg) -> None:
-        # Ignore GCS heartbeats echoed back on the bus
         if msg.type == mavutil.mavlink.MAV_TYPE_GCS:
             return
         self.state.update(
@@ -363,18 +516,29 @@ class MAVLinkConnection:
 
     def _on_battery_status(self, msg) -> None:
         valid_voltages = [v for v in msg.voltages if v != 65535]
-        voltage = sum(valid_voltages) / 1000.0 if valid_voltages else self.state.battery_voltage
+        voltage = (
+            sum(valid_voltages) / 1000.0
+            if valid_voltages
+            else self.state.battery_voltage
+        )
         self.state.update(
             battery_voltage=round(voltage, 2),
             battery_remaining=msg.battery_remaining,
-            battery_current=round(msg.current_battery / 100.0, 2) if msg.current_battery != -1 else self.state.battery_current,
-            battery_consumed_mah=round(msg.current_consumed, 1) if msg.current_consumed != -1 else self.state.battery_consumed_mah,
+            battery_current=(
+                round(msg.current_battery / 100.0, 2)
+                if msg.current_battery != -1
+                else self.state.battery_current
+            ),
+            battery_consumed_mah=(
+                round(msg.current_consumed, 1)
+                if msg.current_consumed != -1
+                else self.state.battery_consumed_mah
+            ),
         )
 
     def _on_sys_status(self, msg) -> None:
         h = msg.onboard_control_sensors_health
         mav = mavutil.mavlink
-        # Only update voltage from SYS_STATUS if BATTERY_STATUS isn't being sent
         if self.state.battery_voltage == 0.0 and msg.voltage_battery != 65535:
             self.state.update(battery_voltage=round(msg.voltage_battery / 1000.0, 2))
         if self.state.battery_current == 0.0 and msg.current_battery != -1:

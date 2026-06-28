@@ -7,10 +7,16 @@ BASE_DIR = Path(__file__).parent
 
 class Settings:
     # ── MAVLink ────────────────────────────────────────────────────────────────
-    MAVLINK_PORT: str = os.environ.get("MAVLINK_PORT", "/dev/ttyACM0")
+    # "auto" scans for Pixhawk on /dev/cu.usbmodem* (macOS) or /dev/ttyACM* (Linux).
+    # Override with MAVLINK_PORT=/dev/cu.usbmodem14201 etc.
+    MAVLINK_PORT: str = os.environ.get("MAVLINK_PORT", "auto")
     MAVLINK_BAUD: int = int(os.environ.get("MAVLINK_BAUD", "57600"))
-    MAVLINK_TIMEOUT: float = float(os.environ.get("MAVLINK_TIMEOUT", "10.0"))
+    # Pixhawk 2.4.8 can take 15+ seconds to boot and send first heartbeat.
+    MAVLINK_TIMEOUT: float = float(os.environ.get("MAVLINK_TIMEOUT", "15.0"))
     HEARTBEAT_TIMEOUT: float = float(os.environ.get("HEARTBEAT_TIMEOUT", "5.0"))
+
+    # Set DEBUG_MAVLINK=1 to log every MAVLink packet sent and received.
+    DEBUG_MAVLINK: bool = os.environ.get("DEBUG_MAVLINK", "").lower() in ("1", "true", "yes")
 
     # ── Safety thresholds ──────────────────────────────────────────────────────
     MIN_BATTERY_VOLTAGE: float = float(os.environ.get("MIN_BATTERY_VOLTAGE", "22.2"))

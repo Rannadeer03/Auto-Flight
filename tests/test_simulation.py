@@ -92,6 +92,8 @@ def _start_simulation():
     patchers = [
         patch("mavlink.mission_upload.MissionUploader.upload_mission", return_value=True),
         patch("mavlink.mission_upload.MissionUploader.clear_mission",  return_value=True),
+        patch("mavlink.mission_upload.MissionUploader.verify_mission",
+              return_value=(True, "Mission verified: 8 items match.")),
         patch("mavlink.commands.MAVLinkCommands.arm",           return_value=True),
         patch("mavlink.commands.MAVLinkCommands.disarm",        return_value=True),
         patch("mavlink.commands.MAVLinkCommands.start_auto",    return_value=True),
@@ -109,6 +111,12 @@ def _make_client():
     from starlette.testclient import TestClient
     from app import app
     return TestClient(app, raise_server_exceptions=False)
+
+
+def _refresh_heartbeat():
+    """Keep the simulated heartbeat alive so heartbeat_ok stays True."""
+    from mavlink.connection import drone_state
+    drone_state.update(last_heartbeat_time=time.monotonic())
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -238,6 +246,7 @@ def test_telemetry(client):
 
 def test_upload(client):
     print(f"\n{BOLD}{CYAN}── Phase 3c: POST /upload (estancia.plan) ───────────────────{RESET}")
+    _refresh_heartbeat()
     raw = PLAN_FILE.read_bytes()
     r   = client.post("/upload",
                       files={"file": ("estancia.plan", raw, "application/octet-stream")})
@@ -245,6 +254,8 @@ def test_upload(client):
     body = r.json()
     check("success == True",          body.get("success") is True)
     check("uploaded_to_drone == True",body.get("uploaded_to_drone") is True)
+    check("verified == True",         body.get("verified") is True,
+          body.get("verification_message", ""))
 
     mi = body.get("mission_info", {})
     check("mission_info present",     bool(mi))
@@ -281,6 +292,7 @@ def test_mission_status(client):
 def test_arm_safety_checks(client):
     print(f"\n{BOLD}{CYAN}── Phase 3e: POST /arm — safety checks ──────────────────────{RESET}")
     from mavlink.connection import drone_state
+    _refresh_heartbeat()
 
     # ARM with healthy state (uploader already mocked globally)
     drone_state.update(battery_voltage=24.84, battery_remaining=97,
@@ -315,6 +327,7 @@ def test_arm_safety_checks(client):
 def test_flight_command_sequence(client):
     print(f"\n{BOLD}{CYAN}── Phase 3f: Flight command sequence ────────────────────────{RESET}")
     from mavlink.connection import drone_state
+    _refresh_heartbeat()
 
     drone_state.update(armed=True, flight_mode="STABILIZE",
                        mission_uploaded=True, ekf_ok=True, gps_fix_type=3)
